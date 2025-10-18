@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::future::Future;
+use std::time::Duration;
 
 use crate::crypto::{decrypt_metadata, derive_meta_key};
 use crate::models::{
@@ -11,6 +13,7 @@ use crate::models::{
 
 const API_BASE: &str = "https://wormhole.app/api";
 const B2_BUCKET_NAME: &str = "socket-dev-prod";
+const MAX_RETRIES: usize = 3;
 
 #[derive(Clone)]
 pub struct WormholeClient {
@@ -26,6 +29,33 @@ impl WormholeClient {
             room_id,
             master_key,
         }
+    }
+
+    /// Helper function to retry an async operation up to MAX_RETRIES times
+    async fn retry_with_backoff<F, Fut, T>(mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match f().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    eprintln!("Attempt {}/{} failed: {}", attempt, MAX_RETRIES, e);
+                    last_error = Some(e);
+
+                    if attempt < MAX_RETRIES {
+                        let delay = Duration::from_millis(500 * (1 << (attempt - 1)));
+                        eprintln!("Retrying in {:?}...", delay);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     pub async fn get_salt(&self) -> Result<Vec<u8>> {
@@ -92,10 +122,10 @@ impl WormholeClient {
         &self,
         chunk_index: usize,
         b2_auth: &B2AuthResponse,
-        mut on_progress: Option<F>,
+        on_progress: Option<F>,
     ) -> Result<Vec<u8>>
     where
-        F: FnMut(usize),
+        F: Fn(usize) + Send + Sync + Clone + 'static,
     {
         use futures::StreamExt;
 
@@ -105,28 +135,35 @@ impl WormholeClient {
             b2_auth.download_url, B2_BUCKET_NAME, chunk_path, b2_auth.authorization_token
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()
-            .context("chunk download failed")?;
+        Self::retry_with_backoff(|| {
+            let on_progress = on_progress.clone();
+            let url = url.clone();
+            async move {
+                let response = self
+                    .client
+                    .get(&url)
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .context("chunk download failed")?;
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
+                let mut stream = response.bytes_stream();
+                let mut buffer = Vec::new();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.context("failed to read chunk bytes")?;
-            let chunk_len = chunk.len();
-            buffer.extend_from_slice(&chunk);
+                while let Some(chunk_result) = stream.next().await {
+                    let chunk = chunk_result.context("failed to read chunk bytes")?;
+                    let chunk_len = chunk.len();
+                    buffer.extend_from_slice(&chunk);
 
-            if let Some(ref mut callback) = on_progress {
-                callback(chunk_len);
+                    if let Some(ref callback) = on_progress {
+                        callback(chunk_len);
+                    }
+                }
+
+                Ok(buffer)
             }
-        }
-
-        Ok(buffer)
+        })
+        .await
     }
 
     pub fn decrypt_torrent(&self, encrypted_torrent_b64: &str, salt: &[u8]) -> Result<Vec<u8>> {
@@ -259,59 +296,71 @@ impl WormholeClient {
         on_progress: Option<F>,
     ) -> Result<()>
     where
-        F: Fn(usize) + Send + 'static,
+        F: Fn(usize) + Send + Sync + Clone + 'static,
     {
         use futures::stream::{self, StreamExt};
         use sha1::{Digest, Sha1};
 
         let data_len = data.len();
 
-        // Calculate SHA1 of data
+        // Calculate SHA1 of data (once, before retries)
         let mut hasher = Sha1::new();
         hasher.update(&data);
         let content_sha1 = format!("{:x}", hasher.finalize());
 
-        // Create the request body with progress reporting
-        let body = if let Some(callback) = on_progress {
-            const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+        Self::retry_with_backoff(|| {
+            let data = data.clone();
+            let on_progress = on_progress.clone();
+            let content_sha1 = content_sha1.clone();
+            let upload_url = upload_token.upload_url.clone();
+            let auth_token = upload_token.authorization_token.clone();
+            let room_id = room_id.to_string();
 
-            // Create a stream that breaks data into chunks and reports progress
-            let stream = stream::iter(
-                data.chunks(STREAM_CHUNK_SIZE)
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>(),
-            )
-            .map(move |chunk| {
-                callback(chunk.len());
-                Ok::<_, std::io::Error>(chunk)
-            });
+            async move {
+                // Create the request body with progress reporting
+                let body = if let Some(callback) = on_progress {
+                    const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 
-            reqwest::Body::wrap_stream(stream)
-        } else {
-            // No progress reporting, just use the data as-is
-            reqwest::Body::from(data)
-        };
+                    // Create a stream that breaks data into chunks and reports progress
+                    let stream = stream::iter(
+                        data.chunks(STREAM_CHUNK_SIZE)
+                            .map(|chunk| chunk.to_vec())
+                            .collect::<Vec<_>>(),
+                    )
+                    .map(move |chunk| {
+                        callback(chunk.len());
+                        Ok::<_, std::io::Error>(chunk)
+                    });
 
-        let response = self
-            .client
-            .post(&upload_token.upload_url)
-            .header("Authorization", &upload_token.authorization_token)
-            .header("X-Bz-File-Name", format!("{}/{}", room_id, chunk_index))
-            .header("X-Bz-Content-Sha1", content_sha1)
-            .header("Content-Length", data_len)
-            .header("Content-Type", "application/octet-stream")
-            .header("User-Agent", "Wormhole-CLI/1.0")
-            .body(body)
-            .send()
-            .await
-            .context("failed to upload to B2")?
-            .error_for_status()
-            .context("B2 upload failed")?;
+                    reqwest::Body::wrap_stream(stream)
+                } else {
+                    // No progress reporting, just use the data as-is
+                    reqwest::Body::from(data)
+                };
 
-        // Consume response
-        let _ = response.bytes().await?;
+                let response = self
+                    .client
+                    .post(&upload_url)
+                    .header("Authorization", &auth_token)
+                    .header("X-Bz-File-Name", format!("{}/{}", room_id, chunk_index))
+                    .header("X-Bz-Content-Sha1", content_sha1)
+                    .header("Content-Length", data_len)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("User-Agent", "Wormhole-CLI/1.0")
+                    .body(body)
+                    .send()
+                    .await
+                    .context("failed to upload to B2")?
+                    .error_for_status()
+                    .context("B2 upload failed")?;
 
-        Ok(())
+                // Consume response
+                let _ = response.bytes().await?;
+
+                Ok(())
+            }
+        })
+        .await
     }
 
     /// Finalize upload

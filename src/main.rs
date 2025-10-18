@@ -910,8 +910,8 @@ async fn stream_download_multi_file(
                     println!("Downloading chunk {}...", chunk_index);
                 }
 
-                let progress_callback = progress_bar.as_ref().map(|pb| {
-                    |bytes: usize| {
+                let progress_callback = progress_bar.cloned().map(|pb| {
+                    move |bytes: usize| {
                         pb.inc(bytes as u64);
                     }
                 });
