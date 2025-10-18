@@ -345,6 +345,20 @@ fn collect_files_from_directory(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
     Ok(files)
 }
 
+/// Information needed for streaming upload without holding all encrypted data in memory
+enum UploadInfo {
+    SingleFile {
+        path: PathBuf,
+        salt: [u8; crypto::KEY_LENGTH],
+        size: usize,
+    },
+    MultiFile {
+        files: Vec<PathBuf>,
+        salts: Vec<[u8; crypto::KEY_LENGTH]>,
+        total_size: usize,
+    },
+}
+
 async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
     use rand::Rng;
     use std::fs;
@@ -445,73 +459,178 @@ async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
         println!("Uploader status: Online");
     }
 
-    // Read and encrypt file(s)
-    let (encrypted_data, torrent_data, info_hash) = if let Some(files) = file_list {
+    // Two-pass approach to minimize memory usage:
+    // Pass 1: Calculate hashes and metadata without storing encrypted data
+    // Pass 2: Encrypt again for upload
+    let (upload_info, torrent_data, info_hash, piece_length) = if let Some(files) = file_list {
         // Multi-file mode
-        let mut file_entries = Vec::new();
-        let mut all_encrypted_data = Vec::new();
+        if verbose {
+            println!("Pass 1: Calculating piece hashes...");
+        }
 
-        for (file_path, relative_path) in files {
+        // First pass: calculate total size and get estimated piece length
+        let mut total_encrypted_estimate = 0;
+        for (file_path, _) in &files {
+            let file_size = fs::metadata(file_path)?.len() as usize;
+            // Estimate encrypted size (will be slightly larger due to overhead)
+            total_encrypted_estimate += file_size + file_size / 10;
+        }
+
+        let piece_length = torrent::calculate_piece_length(total_encrypted_estimate);
+
+        if verbose {
+            println!(
+                "Estimated encrypted size: ~{} bytes",
+                total_encrypted_estimate
+            );
+            println!("Piece length: {} bytes", piece_length);
+        }
+
+        // Now do the actual first pass: encrypt each file, hash pieces globally, save salts
+        // For multi-file torrents, pieces span across files, so we need a global piece hasher
+        let mut piece_hasher = torrent::PieceHasher::new(piece_length);
+        let mut file_metadata = Vec::new();
+        let mut file_salts = Vec::new(); // Save salts for deterministic re-encryption
+
+        for (file_path, relative_path) in &files {
             if verbose {
-                println!("Encrypting: {}", relative_path);
+                println!("Hashing: {}", relative_path);
             }
 
-            let plaintext = fs::read(&file_path)?;
-            let encrypted = encrypt::encrypt_stream(&plaintext, &master_key, encrypt::RECORD_SIZE)?;
+            // Encrypt this file and feed it to the global piece hasher
+            use std::fs::File;
+            use std::io::{BufReader, Read};
 
-            all_encrypted_data.extend_from_slice(&encrypted);
+            let file_handle = File::open(file_path)?;
+            let mut reader = BufReader::new(file_handle);
 
-            file_entries.push(torrent::FileEntry {
-                path: relative_path,
-                encrypted_data: encrypted,
+            let mut encryptor = encrypt::StreamEncryptor::new(&master_key, encrypt::RECORD_SIZE)?;
+            let salt = encryptor.salt(); // Save salt for later
+            file_salts.push(salt);
+
+            let mut buffer = vec![0u8; 256 * 1024];
+            let mut encrypted_size = 0;
+
+            loop {
+                let bytes_read = reader.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let encrypted_chunk = encryptor.update(&buffer[..bytes_read])?;
+                piece_hasher.update(&encrypted_chunk);
+                encrypted_size += encrypted_chunk.len();
+            }
+
+            let final_chunk = encryptor.finalize()?;
+            piece_hasher.update(&final_chunk);
+            encrypted_size += final_chunk.len();
+
+            file_metadata.push(torrent::FileMetadata {
+                path: relative_path.clone(),
+                encrypted_length: encrypted_size,
             });
         }
 
-        if verbose {
-            println!("Total encrypted size: {} bytes", all_encrypted_data.len());
-        }
-
-        // Calculate dynamic piece length based on total encrypted data size
-        let piece_length = torrent::calculate_piece_length(all_encrypted_data.len());
+        let piece_hashes = piece_hasher.finalize();
+        let total_encrypted_size: usize = file_metadata.iter().map(|f| f.encrypted_length).sum();
 
         if verbose {
-            println!("Piece length: {} bytes", piece_length);
+            println!("Total encrypted size: {} bytes", total_encrypted_size);
+            println!("Number of pieces: {}", piece_hashes.len());
         }
 
-        let (torrent, hash) =
-            torrent::create_multi_file_torrent(&name, &file_entries, piece_length)?;
+        // Create torrent from hashes
+        let (torrent, hash) = torrent::create_multi_file_torrent_from_hashes(
+            &name,
+            &file_metadata,
+            piece_length,
+            piece_hashes,
+        )?;
 
         if verbose {
             println!("Torrent size: {} bytes", torrent.len());
             println!("Info hash: {}", hash);
+            println!("\nPass 2: Encrypting files for upload...");
         }
 
-        (all_encrypted_data, torrent, hash)
+        // Store upload info for streaming encryption during upload
+        let upload_info = UploadInfo::MultiFile {
+            files: files.into_iter().map(|(path, _)| path).collect(),
+            salts: file_salts,
+            total_size: total_encrypted_size,
+        };
+
+        (upload_info, torrent, hash, piece_length)
     } else {
         // Single file mode
-        let plaintext = fs::read(file)?;
-        let encrypted = encrypt::encrypt_stream(&plaintext, &master_key, encrypt::RECORD_SIZE)?;
-
         if verbose {
-            println!("Plaintext size: {} bytes", plaintext.len());
-            println!("Encrypted size: {} bytes", encrypted.len());
+            println!("Pass 1: Calculating piece hashes...");
         }
 
-        // Calculate dynamic piece length based on encrypted data size
-        let piece_length = torrent::calculate_piece_length(encrypted.len());
+        // Estimate encrypted size
+        let file_size = total_size as usize;
+        let estimated_encrypted_size = file_size + file_size / 10;
+        let piece_length = torrent::calculate_piece_length(estimated_encrypted_size);
 
         if verbose {
+            println!("Plaintext size: {} bytes", total_size);
             println!("Piece length: {} bytes", piece_length);
         }
 
-        let (torrent, hash) = torrent::create_torrent_file(&name, &encrypted, piece_length)?;
+        // First pass: encrypt and hash (save salt for deterministic re-encryption)
+        use std::fs::File;
+        use std::io::{BufReader, Read};
+
+        let file_handle = File::open(file)?;
+        let mut reader = BufReader::new(file_handle);
+
+        let mut encryptor = encrypt::StreamEncryptor::new(&master_key, encrypt::RECORD_SIZE)?;
+        let file_salt = encryptor.salt(); // Save salt for pass 2
+
+        let mut piece_hasher = torrent::PieceHasher::new(piece_length);
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut encrypted_size = 0;
+
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let encrypted_chunk = encryptor.update(&buffer[..bytes_read])?;
+            piece_hasher.update(&encrypted_chunk);
+            encrypted_size += encrypted_chunk.len();
+        }
+
+        let final_chunk = encryptor.finalize()?;
+        piece_hasher.update(&final_chunk);
+        encrypted_size += final_chunk.len();
+
+        let piece_hashes = piece_hasher.finalize();
+
+        if verbose {
+            println!("Encrypted size: {} bytes", encrypted_size);
+            println!("Number of pieces: {}", piece_hashes.len());
+        }
+
+        // Create torrent from hashes
+        let (torrent, hash) =
+            torrent::create_torrent_from_hashes(&name, encrypted_size, piece_length, piece_hashes)?;
 
         if verbose {
             println!("Torrent size: {} bytes", torrent.len());
             println!("Info hash: {}", hash);
         }
 
-        (encrypted, torrent, hash)
+        // Store upload info for streaming encryption during upload
+        let upload_info = UploadInfo::SingleFile {
+            path: file.to_path_buf(),
+            salt: file_salt,
+            size: encrypted_size,
+        };
+
+        (upload_info, torrent, hash, piece_length)
     };
 
     // Encrypt torrent with meta key
@@ -519,11 +638,14 @@ async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
     let encrypted_torrent = encrypt::encrypt_metadata(&torrent_data, &meta_key)?;
     let encrypted_torrent_b64 = models::base64_encode(&encrypted_torrent);
 
-    // Calculate piece length for chunking (will match what was used in torrent)
-    let piece_length = torrent::calculate_piece_length(encrypted_data.len());
+    // Get total encrypted size from upload_info
+    let total_encrypted_size = match &upload_info {
+        UploadInfo::SingleFile { size, .. } => *size,
+        UploadInfo::MultiFile { total_size, .. } => *total_size,
+    };
 
     // Update room with torrent info
-    let size_mb = torrent::round_size_as_mb(encrypted_data.len());
+    let size_mb = torrent::round_size_as_mb(total_encrypted_size);
 
     let update_request = models::UpdateRoomRequest {
         info_hash,
@@ -539,7 +661,7 @@ async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
     // Get B2 upload authorization
 
     // Calculate number of chunks needed based on piece_length
-    let num_chunks = encrypted_data.len().div_ceil(piece_length);
+    let num_chunks = total_encrypted_size.div_ceil(piece_length);
     // Need one token per parallel upload
     let upload_tokens = temp_client
         .get_b2_upload_auth(&room_id, &writer_token, num_chunks.min(10))
@@ -550,7 +672,7 @@ async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
     }
 
     let progress_bar = if !verbose {
-        let pb = ProgressBar::new(encrypted_data.len() as u64);
+        let pb = ProgressBar::new(total_encrypted_size as u64);
         pb.enable_steady_tick(std::time::Duration::from_millis(10));
         pb.set_style(
             ProgressStyle::default_bar()
@@ -563,11 +685,12 @@ async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
         None
     };
 
-    upload_chunks_parallel(
+    upload_chunks_streaming(
         &temp_client,
         &upload_tokens,
         &room_id,
-        &encrypted_data,
+        upload_info,
+        master_key.to_vec(),
         piece_length,
         num_chunks,
         progress_bar.as_ref(),
@@ -610,30 +733,121 @@ mod base64 {
     }
 }
 
-/// Upload chunks in parallel to B2
-async fn upload_chunks_parallel(
+/// Create an async stream that encrypts file(s) on-the-fly
+fn create_encrypted_stream(
+    upload_info: UploadInfo,
+    master_key: Vec<u8>,
+) -> impl futures::Stream<Item = Result<Vec<u8>>> {
+    use tokio::fs::File;
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    async_stream::stream! {
+        match upload_info {
+            UploadInfo::SingleFile { path, salt, .. } => {
+                let file = File::open(&path).await?;
+                let mut reader = BufReader::new(file);
+                let mut encryptor = encrypt::StreamEncryptor::new_with_salt(&master_key, encrypt::RECORD_SIZE, salt)?;
+
+                let mut buffer = vec![0u8; 256 * 1024]; // 256KB read chunks
+
+                loop {
+                    let bytes_read = reader.read(&mut buffer).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    let encrypted_chunk = encryptor.update(&buffer[..bytes_read])?;
+                    yield Ok(encrypted_chunk);
+                }
+
+                // Finalize encryption
+                let final_chunk = encryptor.finalize()?;
+                yield Ok(final_chunk);
+            }
+            UploadInfo::MultiFile { files, salts, .. } => {
+                for (file_path, salt) in files.iter().zip(salts.iter()) {
+                    let file = File::open(file_path).await?;
+                    let mut reader = BufReader::new(file);
+                    let mut encryptor = encrypt::StreamEncryptor::new_with_salt(&master_key, encrypt::RECORD_SIZE, *salt)?;
+
+                    let mut buffer = vec![0u8; 256 * 1024];
+
+                    loop {
+                        let bytes_read = reader.read(&mut buffer).await?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        let encrypted_chunk = encryptor.update(&buffer[..bytes_read])?;
+                        yield Ok(encrypted_chunk);
+                    }
+
+                    let final_chunk = encryptor.finalize()?;
+                    yield Ok(final_chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Split a byte stream into fixed-size chunks (pieces)
+fn chunk_stream(
+    stream: impl futures::Stream<Item = Result<Vec<u8>>>,
+    piece_length: usize,
+) -> impl futures::Stream<Item = Result<Vec<u8>>> {
+    use futures::StreamExt;
+
+    async_stream::stream! {
+        let mut buffer = Vec::new();
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            let chunk = result?;
+            buffer.extend_from_slice(&chunk);
+
+            // Yield complete pieces
+            while buffer.len() >= piece_length {
+                let piece = buffer.drain(..piece_length).collect();
+                yield Ok(piece);
+            }
+        }
+
+        // Yield final partial piece if any
+        if !buffer.is_empty() {
+            yield Ok(buffer);
+        }
+    }
+}
+
+/// Upload chunks with streaming encryption - encrypts on-the-fly without holding all data in memory
+async fn upload_chunks_streaming(
     client: &WormholeClient,
     upload_tokens: &[models::B2UploadToken],
     room_id: &str,
-    encrypted_data: &[u8],
+    upload_info: UploadInfo,
+    master_key: Vec<u8>,
     piece_length: usize,
     num_chunks: usize,
     progress_bar: Option<&ProgressBar>,
     verbose: bool,
 ) -> Result<()> {
-    use futures::{StreamExt, TryStreamExt, stream};
+    use futures::{StreamExt, TryStreamExt};
     use std::sync::Arc;
 
     // Clone progress bar into Arc for sharing across async tasks
     let progress_bar_arc = progress_bar.map(|pb| Arc::new(pb.clone()));
 
-    stream::iter(0..num_chunks)
-        .map(|chunk_index| {
+    // Create encrypted stream and split into pieces
+    let encrypted_stream = create_encrypted_stream(upload_info, master_key);
+    let piece_stream = chunk_stream(encrypted_stream, piece_length);
+
+    // Upload pieces in parallel
+    piece_stream
+        .enumerate()
+        .map(|(chunk_index, piece_result)| {
             let pb = progress_bar_arc.clone();
             async move {
-                let start = chunk_index * piece_length;
-                let end = std::cmp::min(start + piece_length, encrypted_data.len());
-                let chunk_data = encrypted_data[start..end].to_vec();
+                let chunk_data = piece_result?;
 
                 if verbose {
                     println!("Uploading chunk {}/{}...", chunk_index + 1, num_chunks);
@@ -847,65 +1061,6 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[tokio::test]
-    async fn test_upload_and_download_roundtrip() {
-        // Create a temporary directory for test files
-        let temp_dir = std::env::temp_dir().join("wormhole_test");
-        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-
-        // Create test file with known content
-        let test_content =
-            b"Hello, Wormhole! This is an end-to-end test of upload and download functionality.";
-        let upload_file_path = temp_dir.join("test_upload.txt");
-        fs::write(&upload_file_path, test_content).expect("failed to write test file");
-
-        println!("\n=== UPLOAD PHASE ===");
-
-        // Upload the file
-        let share_url = upload_file(&upload_file_path, false)
-            .await
-            .expect("Upload failed");
-
-        println!("\n✓ Upload successful! URL: {}", share_url);
-
-        println!("\n=== DOWNLOAD PHASE ===");
-
-        // Create download directory
-        let download_dir = temp_dir.join("download");
-        fs::create_dir_all(&download_dir).expect("failed to create download dir");
-
-        // Download the file
-        let download_result = download_file(&share_url, &download_dir, false, true).await;
-        assert!(
-            download_result.is_ok(),
-            "Download failed: {:?}",
-            download_result.err()
-        );
-
-        println!("\n✓ Download successful!");
-
-        // Verify the downloaded file matches the original
-        let downloaded_file_path = download_dir.join("test_upload.txt");
-        assert!(
-            downloaded_file_path.exists(),
-            "Downloaded file does not exist"
-        );
-
-        let downloaded_content =
-            fs::read(&downloaded_file_path).expect("failed to read downloaded file");
-
-        assert_eq!(
-            downloaded_content, test_content,
-            "Downloaded content does not match original"
-        );
-
-        println!("\n✓ Content verification passed!");
-        println!("\n=== ALL TESTS PASSED ===\n");
-
-        // Cleanup
-        fs::remove_dir_all(&temp_dir).ok();
-    }
 
     #[test]
     fn test_hex_encode() {

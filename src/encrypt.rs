@@ -46,64 +46,158 @@ pub fn encrypt_metadata(plaintext_meta: &[u8], meta_key: &[u8]) -> Result<Vec<u8
     Ok(result)
 }
 
-/// Encrypt data stream using RFC 8188 aes128gcm content encoding
+/// Streaming encryptor for RFC 8188 aes128gcm content encoding
 ///
-/// # Arguments
-/// * `plaintext` - Bytes to encrypt
-/// * `master_key` - 16-byte master encryption key
-/// * `record_size` - Size of each encrypted record (default 64KB)
-///
-/// # Returns
-/// Encrypted data with RFC 8188 header
-pub fn encrypt_stream(plaintext: &[u8], master_key: &[u8], record_size: usize) -> Result<Vec<u8>> {
-    // Generate random salt for this stream
-    let salt: [u8; KEY_LENGTH] = rand::thread_rng().r#gen();
+/// Encrypts data incrementally without loading entire file into memory
+pub struct StreamEncryptor {
+    cipher: Aes128Gcm,
+    nonce_base: Vec<u8>,
+    record_size: usize,
+    max_plaintext_per_record: usize,
+    seq: u32,
+    buffer: Vec<u8>,
+    header_emitted: bool,
+    finished: bool,
+    salt: [u8; KEY_LENGTH],
+}
 
-    // Derive keys
-    let content_key = derive_content_key(master_key, &salt)?;
-    let nonce_base = derive_nonce_base(master_key, &salt)?;
+impl StreamEncryptor {
+    /// Create a new streaming encryptor
+    ///
+    /// # Arguments
+    /// * `master_key` - 16-byte master encryption key
+    /// * `record_size` - Size of each encrypted record (default 64KB)
+    pub fn new(master_key: &[u8], record_size: usize) -> Result<Self> {
+        // Generate random salt for this stream
+        let salt: [u8; KEY_LENGTH] = rand::thread_rng().r#gen();
+        Self::new_with_salt(master_key, record_size, salt)
+    }
 
-    // Create AESGCM cipher
-    let cipher = Aes128Gcm::new_from_slice(&content_key)
-        .map_err(|_| anyhow::anyhow!("invalid key length"))?;
+    /// Create a new streaming encryptor with a specific salt
+    ///
+    /// This is useful for deterministic encryption when you need to encrypt the same data multiple times
+    pub fn new_with_salt(
+        master_key: &[u8],
+        record_size: usize,
+        salt: [u8; KEY_LENGTH],
+    ) -> Result<Self> {
+        // Derive keys
+        let content_key = derive_content_key(master_key, &salt)?;
+        let nonce_base = derive_nonce_base(master_key, &salt)?;
 
-    // Build header: salt (16) + record_size (4) + idlen (1)
-    let mut output = Vec::new();
-    output.extend_from_slice(&salt);
-    output.extend_from_slice(&(record_size as u32).to_be_bytes());
-    output.push(0); // idlen = 0
+        // Create AESGCM cipher
+        let cipher = Aes128Gcm::new_from_slice(&content_key)
+            .map_err(|_| anyhow::anyhow!("invalid key length"))?;
 
-    // Calculate overhead per record (TAG_LENGTH for auth tag + 1 for delimiter)
-    let overhead_per_record = TAG_LENGTH + 1;
-    let max_plaintext_per_record = record_size - overhead_per_record;
+        // Calculate overhead per record (TAG_LENGTH for auth tag + 1 for delimiter)
+        let overhead_per_record = TAG_LENGTH + 1;
+        let max_plaintext_per_record = record_size - overhead_per_record;
 
-    let mut offset = 0;
-    let mut seq = 0;
+        Ok(Self {
+            cipher,
+            nonce_base,
+            record_size,
+            max_plaintext_per_record,
+            seq: 0,
+            buffer: Vec::new(),
+            header_emitted: false,
+            finished: false,
+            salt,
+        })
+    }
 
-    while offset < plaintext.len() {
-        // Get plaintext chunk for this record
-        let chunk_end = std::cmp::min(offset + max_plaintext_per_record, plaintext.len());
-        let chunk = &plaintext[offset..chunk_end];
-        let is_last = chunk_end == plaintext.len();
+    /// Get the salt used by this encryptor
+    pub fn salt(&self) -> [u8; KEY_LENGTH] {
+        self.salt
+    }
 
-        // Pad the chunk
-        let padded = pad_record(chunk, is_last);
+    /// Get the RFC 8188 header
+    fn get_header(&self) -> Vec<u8> {
+        let mut header = Vec::with_capacity(21);
+        header.extend_from_slice(&self.salt);
+        header.extend_from_slice(&(self.record_size as u32).to_be_bytes());
+        header.push(0); // idlen = 0
+        header
+    }
+
+    /// Process a chunk of plaintext data
+    ///
+    /// Returns encrypted records that are ready to be written
+    /// May return empty vec if buffering data for next record
+    pub fn update(&mut self, chunk: &[u8]) -> Result<Vec<u8>> {
+        if self.finished {
+            anyhow::bail!("StreamEncryptor already finalized");
+        }
+
+        let mut output = Vec::new();
+
+        // Emit header on first call
+        if !self.header_emitted {
+            output.extend_from_slice(&self.get_header());
+            self.header_emitted = true;
+        }
+
+        // Add new data to buffer
+        self.buffer.extend_from_slice(chunk);
+
+        // Process complete records from buffer
+        while self.buffer.len() >= self.max_plaintext_per_record {
+            let plaintext_chunk = self
+                .buffer
+                .drain(..self.max_plaintext_per_record)
+                .collect::<Vec<u8>>();
+            let encrypted_record = self.encrypt_record(&plaintext_chunk, false)?;
+            output.extend_from_slice(&encrypted_record);
+        }
+
+        Ok(output)
+    }
+
+    /// Finalize the stream and encrypt any remaining buffered data
+    ///
+    /// Must be called after all data has been passed to update()
+    pub fn finalize(&mut self) -> Result<Vec<u8>> {
+        if self.finished {
+            anyhow::bail!("StreamEncryptor already finalized");
+        }
+
+        let mut output = Vec::new();
+
+        // Emit header if not yet emitted (edge case: no data was ever passed to update)
+        if !self.header_emitted {
+            output.extend_from_slice(&self.get_header());
+            self.header_emitted = true;
+        }
+
+        // Encrypt final record with remaining buffer data
+        if !self.buffer.is_empty() || self.seq == 0 {
+            // Always emit at least one record, even if empty
+            let plaintext_chunk = self.buffer.drain(..).collect::<Vec<u8>>();
+            let encrypted_record = self.encrypt_record(&plaintext_chunk, true)?;
+            output.extend_from_slice(&encrypted_record);
+        }
+
+        self.finished = true;
+        Ok(output)
+    }
+
+    /// Encrypt a single record
+    fn encrypt_record(&mut self, plaintext: &[u8], is_last: bool) -> Result<Vec<u8>> {
+        // Pad the plaintext
+        let padded = pad_record(plaintext, is_last);
 
         // Generate nonce and encrypt
-        let nonce_bytes = generate_nonce(&nonce_base, seq)?;
+        let nonce_bytes = generate_nonce(&self.nonce_base, self.seq)?;
         let nonce = GenericArray::from_slice(&nonce_bytes);
 
-        let encrypted_record = cipher
+        let encrypted_record = self
+            .cipher
             .encrypt(nonce, padded.as_slice())
             .map_err(|_| anyhow::anyhow!("failed to encrypt record"))?;
 
-        output.extend_from_slice(&encrypted_record);
-
-        offset = chunk_end;
-        seq += 1;
+        self.seq += 1;
+        Ok(encrypted_record)
     }
-
-    Ok(output)
 }
 
 /// Add padding to plaintext record before encryption
@@ -120,7 +214,29 @@ fn pad_record(data: &[u8], is_last: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::crypto::decrypt_metadata;
+
+    /// Encrypt data stream using RFC 8188 aes128gcm content encoding
+    ///
+    /// # Arguments
+    /// * `plaintext` - Bytes to encrypt
+    /// * `master_key` - 16-byte master encryption key
+    /// * `record_size` - Size of each encrypted record (default 64KB)
+    ///
+    /// # Returns
+    /// Encrypted data with RFC 8188 header
+    pub fn encrypt_stream(
+        plaintext: &[u8],
+        master_key: &[u8],
+        record_size: usize,
+    ) -> Result<Vec<u8>> {
+        // Use the streaming encryptor for compatibility
+        let mut encryptor = StreamEncryptor::new(master_key, record_size)?;
+        let mut output = encryptor.update(plaintext)?;
+        output.extend_from_slice(&encryptor.finalize()?);
+        Ok(output)
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
