@@ -60,6 +60,16 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Show file status and metadata from a wormhole.app URL
+    Info {
+        /// Wormhole URL (e.g., https://wormhole.app/vbrQp4#D3r_nHhqnxiCgKE4pZTtOw)
+        #[arg()]
+        url: String,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +87,7 @@ async fn main() -> Result<()> {
             upload_file(&path, verbose).await?;
             Ok(())
         }
+        Commands::Info { url, verbose } => info_file(&url, verbose).await,
     }
 }
 
@@ -198,6 +209,94 @@ async fn download_file(url: &str, output: &Path, verbose: bool, replace: bool) -
         println!("\nTotal chunks: {}", torrent_info.num_pieces);
     }
 
+    Ok(())
+}
+
+async fn info_file(url: &str, verbose: bool) -> Result<()> {
+    let wormhole_url = WormholeUrl::parse(url)?;
+
+    if verbose {
+        println!("Room ID: {}", wormhole_url.room_id);
+        println!("Master Key: {}", hex_encode(&wormhole_url.key));
+    }
+
+    let client = WormholeClient::new(wormhole_url.room_id.clone(), wormhole_url.key.clone());
+
+    let salt = client.get_salt().await?;
+
+    if verbose {
+        println!("Salt: {}", hex_encode(&salt));
+    }
+
+    let auth_token = derive_auth_token(&wormhole_url.key, &salt)?;
+
+    if verbose {
+        println!("Auth Token: {}", models::base64_encode(&auth_token));
+    }
+
+    let room_data = client.get_room(&auth_token).await?;
+
+    let torrent_data = client.decrypt_torrent(&room_data.encrypted_torrent_file, &salt)?;
+    let torrent_info = parse_torrent(&torrent_data)?;
+
+    // Display file information
+    println!("URL: {}", url);
+    println!("Room ID: {}", wormhole_url.room_id);
+    println!("\nFile Information:");
+    println!("  Name: {}", torrent_info.name);
+    println!(
+        "  Type: {}",
+        if torrent_info.multi_file {
+            "Directory"
+        } else {
+            "File"
+        }
+    );
+    println!(
+        "  Total Size: {} ({})",
+        format_size(torrent_info.total_length as u64),
+        torrent_info.total_length
+    );
+
+    if torrent_info.multi_file {
+        println!("  Files: {}", torrent_info.files.len());
+        println!("\n  Files in archive:");
+        for file_info in &torrent_info.files {
+            let size = file_info.encrypted_length;
+            println!("    {:>12}  {}", format_size(size as u64), file_info.path);
+        }
+    }
+
+    println!("\nTorrent Information:");
+    println!("  Pieces: {}", torrent_info.num_pieces);
+    println!(
+        "  Piece Length: {} ({})",
+        format_size(torrent_info.piece_length as u64),
+        torrent_info.piece_length
+    );
+
+    println!("\nAvailability:");
+    println!(
+        "  Status: {}",
+        match room_data.cloud_state.as_deref() {
+            Some("complete") => "✓ Available",
+            Some(state) => state,
+            None => "Unknown",
+        }
+    );
+
+    if let Some(remaining) = room_data.remaining_downloads {
+        println!("  Remaining Downloads: {}", remaining);
+    }
+
+    if verbose {
+        println!("\nVerbose Information:");
+        println!("  Cloud State: {:?}", room_data.cloud_state);
+        println!("  Multi-File: {:?}", room_data.multi_file);
+        println!("  Torrent Size: {} bytes", torrent_data.len());
+    }
+
+    println!();
     Ok(())
 }
 
