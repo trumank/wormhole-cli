@@ -1,15 +1,17 @@
-//! Wormhole File Downloader CLI
+//! Wormhole CLI
 //!
-//! Downloads and decrypts files from wormhole.app URLs
+//! Download and upload files to wormhole.app
 
 mod api;
 mod bencode;
 mod crypto;
 mod decrypt;
+mod encrypt;
 mod models;
+mod torrent;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 
@@ -19,37 +21,69 @@ use crypto::derive_auth_token;
 use decrypt::MultiFileDecryptor;
 use models::WormholeUrl;
 
-/// Wormhole File Downloader
+/// Wormhole CLI - Download and upload files to wormhole.app
 #[derive(Parser, Debug)]
 #[command(name = "wormhole-cli")]
-#[command(about = "Download and decrypt files from wormhole.app", long_about = None)]
+#[command(about = "Download and upload files to wormhole.app", long_about = None)]
 struct Args {
-    /// Wormhole URL (e.g., https://wormhole.app/vbrQp4#D3r_nHhqnxiCgKE4pZTtOw)
-    #[arg()]
-    url: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Output directory (defaults to current directory)
-    #[arg(short, long, default_value = ".")]
-    output: PathBuf,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Download and decrypt files from a wormhole.app URL
+    Download {
+        /// Wormhole URL (e.g., https://wormhole.app/vbrQp4#D3r_nHhqnxiCgKE4pZTtOw)
+        #[arg()]
+        url: String,
 
-    /// Verbose output
-    #[arg(short, long)]
-    verbose: bool,
+        /// Output directory (defaults to current directory)
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
 
-    /// Replace existing files without prompting
-    #[arg(short, long)]
-    replace: bool,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Replace existing files without prompting
+        #[arg(short, long)]
+        replace: bool,
+    },
+    /// Upload and encrypt files or directories to wormhole.app
+    Upload {
+        /// File or directory to upload
+        #[arg()]
+        path: PathBuf,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    download_file(&Args::parse()).await
+    let args = Args::parse();
+
+    match args.command {
+        Commands::Download {
+            url,
+            output,
+            verbose,
+            replace,
+        } => download_file(&url, &output, verbose, replace).await,
+        Commands::Upload { path, verbose } => {
+            upload_file(&path, verbose).await?;
+            Ok(())
+        }
+    }
 }
 
-async fn download_file(args: &Args) -> Result<()> {
-    let wormhole_url = WormholeUrl::parse(&args.url)?;
+async fn download_file(url: &str, output: &Path, verbose: bool, replace: bool) -> Result<()> {
+    let wormhole_url = WormholeUrl::parse(url)?;
 
-    if args.verbose {
+    if verbose {
         println!("Room ID: {}", wormhole_url.room_id);
         println!("Master Key: {}", hex_encode(&wormhole_url.key));
     }
@@ -58,19 +92,19 @@ async fn download_file(args: &Args) -> Result<()> {
 
     let salt = client.get_salt().await?;
 
-    if args.verbose {
+    if verbose {
         println!("Salt: {}", hex_encode(&salt));
     }
 
     let auth_token = derive_auth_token(&wormhole_url.key, &salt)?;
 
-    if args.verbose {
+    if verbose {
         println!("Auth Token: {}", models::base64_encode(&auth_token));
     }
 
     let room_data = client.get_room(&auth_token).await?;
 
-    if args.verbose {
+    if verbose {
         println!("Cloud State: {:?}", room_data.cloud_state);
         println!("Multi-File: {:?}", room_data.multi_file);
         println!("Remaining Downloads: {:?}", room_data.remaining_downloads);
@@ -78,14 +112,14 @@ async fn download_file(args: &Args) -> Result<()> {
 
     let torrent_data = client.decrypt_torrent(&room_data.encrypted_torrent_file, &salt)?;
 
-    if args.verbose {
+    if verbose {
         println!("Torrent size: {} bytes", torrent_data.len());
     }
 
     // Parse torrent to get number of pieces
     let torrent_info = parse_torrent(&torrent_data)?;
 
-    if args.verbose {
+    if verbose {
         println!("Filename: {}", torrent_info.name);
         println!("Number of pieces: {}", torrent_info.num_pieces);
         println!("Piece length: {} bytes", torrent_info.piece_length);
@@ -98,24 +132,22 @@ async fn download_file(args: &Args) -> Result<()> {
 
     let b2_auth = client.get_b2_auth(&auth_token).await?;
 
-    if args.verbose {
+    if verbose {
         println!("Download URL: {}", b2_auth.download_url);
     }
 
-    let output = args.output.clone();
-
     // Create output directory if it doesn't exist
-    std::fs::create_dir_all(&output).context("failed to create output directory")?;
+    std::fs::create_dir_all(output).context("failed to create output directory")?;
 
     // Validate all file paths, check for existing files, and create directories upfront
-    let files_to_download = validate_and_prepare_paths(&torrent_info.files, &output, args.replace)?;
+    let files_to_download = validate_and_prepare_paths(&torrent_info.files, output, replace)?;
 
     if files_to_download.is_empty() {
         println!("No files to download.");
         return Ok(());
     }
 
-    let progress_bar = if !args.verbose {
+    let progress_bar = if !verbose {
         let pb = ProgressBar::new(torrent_info.total_length as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -133,9 +165,9 @@ async fn download_file(args: &Args) -> Result<()> {
         &b2_auth,
         &wormhole_url.key,
         &torrent_info,
-        output.clone(),
+        output.to_path_buf(),
         progress_bar.as_ref(),
-        args.verbose,
+        verbose,
         files_to_download.clone(),
     )
     .await?;
@@ -162,9 +194,372 @@ async fn download_file(args: &Args) -> Result<()> {
         }
     }
 
-    if args.verbose {
+    if verbose {
         println!("\nTotal chunks: {}", torrent_info.num_pieces);
     }
+
+    Ok(())
+}
+
+/// Collect all files from a directory recursively
+fn collect_files_from_directory(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+    use std::fs;
+
+    let mut files = Vec::new();
+
+    fn walk_dir(
+        base_dir: &Path,
+        current_dir: &Path,
+        files: &mut Vec<(PathBuf, String)>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() {
+                // Calculate relative path from base_dir
+                let relative = path
+                    .strip_prefix(base_dir)
+                    .context("failed to strip prefix")?;
+                let relative_str = relative
+                    .to_str()
+                    .context("path not valid UTF-8")?
+                    .replace('\\', "/"); // Normalize to forward slashes
+
+                files.push((path.clone(), relative_str));
+            } else if path.is_dir() {
+                walk_dir(base_dir, &path, files)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk_dir(dir, dir, &mut files)?;
+
+    // Sort for consistent ordering
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+
+    if files.is_empty() {
+        anyhow::bail!("Directory is empty: {}", dir.display());
+    }
+
+    Ok(files)
+}
+
+async fn upload_file(file: &Path, verbose: bool) -> Result<String> {
+    use rand::Rng;
+    use std::fs;
+
+    // Check path exists
+    if !file.exists() {
+        anyhow::bail!("Path not found: {}", file.display());
+    }
+
+    let is_directory = file.is_dir();
+    let metadata = fs::metadata(file)?;
+
+    let (name, total_size, file_list) = if is_directory {
+        // Directory mode
+        let files = collect_files_from_directory(file)?;
+        let dir_name = file
+            .file_name()
+            .context("invalid directory name")?
+            .to_str()
+            .context("directory name not valid UTF-8")?;
+
+        let total: u64 = files
+            .iter()
+            .map(|(path, _)| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            .sum();
+
+        (dir_name.to_string(), total, Some(files))
+    } else {
+        // Single file mode
+        let filename = file
+            .file_name()
+            .context("invalid filename")?
+            .to_str()
+            .context("filename not valid UTF-8")?;
+        (filename.to_string(), metadata.len(), None)
+    };
+
+    println!(
+        "\n{}: {}",
+        if is_directory { "Directory" } else { "File" },
+        file.display()
+    );
+    if let Some(ref files) = file_list {
+        println!("Files: {}", files.len());
+    }
+    println!(
+        "Size: {} bytes ({:.2} MB)",
+        total_size,
+        total_size as f64 / (1024.0 * 1024.0)
+    );
+
+    // Generate master key and salt
+    let master_key: [u8; crypto::KEY_LENGTH] = rand::thread_rng().r#gen();
+    let salt: [u8; crypto::KEY_LENGTH] = rand::thread_rng().r#gen();
+
+    if verbose {
+        println!("Master Key: {}", hex_encode(&master_key));
+        println!("Salt: {}", hex_encode(&salt));
+    }
+
+    // Derive tokens
+    let reader_token = crypto::derive_auth_token(&master_key, &salt)?;
+    let reader_token_b64 = models::base64_encode(&reader_token);
+    let salt_b64 = models::base64_encode(&salt);
+
+    if verbose {
+        println!("Reader Token: {}", reader_token_b64);
+    }
+
+    // Create room
+    if verbose {
+        println!("Creating room...");
+    }
+
+    // Create a temporary client just for room creation
+    let temp_client = WormholeClient::new(String::new(), master_key.to_vec());
+    let room_data = temp_client
+        .create_room(&reader_token_b64, &salt_b64)
+        .await?;
+
+    let room_id = room_data.id.clone();
+    let writer_token_b64 = room_data.writer_token.clone();
+
+    if verbose {
+        println!("Room ID: {}", room_id);
+        println!("Writer Token: {}", writer_token_b64);
+    }
+
+    // Decode writer token for auth
+    let writer_token = base64::decode(&writer_token_b64)?;
+
+    // Mark uploader as online
+    temp_client
+        .mark_uploader_online(&room_id, &writer_token)
+        .await?;
+
+    if verbose {
+        println!("Uploader status: Online");
+    }
+
+    // Read and encrypt file(s)
+    let (encrypted_data, torrent_data, info_hash) = if let Some(files) = file_list {
+        // Multi-file mode
+        let mut file_entries = Vec::new();
+        let mut all_encrypted_data = Vec::new();
+
+        for (file_path, relative_path) in files {
+            if verbose {
+                println!("Encrypting: {}", relative_path);
+            }
+
+            let plaintext = fs::read(&file_path)?;
+            let encrypted = encrypt::encrypt_stream(&plaintext, &master_key, encrypt::RECORD_SIZE)?;
+
+            all_encrypted_data.extend_from_slice(&encrypted);
+
+            file_entries.push(torrent::FileEntry {
+                path: relative_path,
+                encrypted_data: encrypted,
+            });
+        }
+
+        if verbose {
+            println!("Total encrypted size: {} bytes", all_encrypted_data.len());
+        }
+
+        // Calculate dynamic piece length based on total encrypted data size
+        let piece_length = torrent::calculate_piece_length(all_encrypted_data.len());
+
+        if verbose {
+            println!("Piece length: {} bytes", piece_length);
+        }
+
+        let (torrent, hash) =
+            torrent::create_multi_file_torrent(&name, &file_entries, piece_length)?;
+
+        if verbose {
+            println!("Torrent size: {} bytes", torrent.len());
+            println!("Info hash: {}", hash);
+        }
+
+        (all_encrypted_data, torrent, hash)
+    } else {
+        // Single file mode
+        let plaintext = fs::read(file)?;
+        let encrypted = encrypt::encrypt_stream(&plaintext, &master_key, encrypt::RECORD_SIZE)?;
+
+        if verbose {
+            println!("Plaintext size: {} bytes", plaintext.len());
+            println!("Encrypted size: {} bytes", encrypted.len());
+        }
+
+        // Calculate dynamic piece length based on encrypted data size
+        let piece_length = torrent::calculate_piece_length(encrypted.len());
+
+        if verbose {
+            println!("Piece length: {} bytes", piece_length);
+        }
+
+        let (torrent, hash) = torrent::create_torrent_file(&name, &encrypted, piece_length)?;
+
+        if verbose {
+            println!("Torrent size: {} bytes", torrent.len());
+            println!("Info hash: {}", hash);
+        }
+
+        (encrypted, torrent, hash)
+    };
+
+    // Encrypt torrent with meta key
+    let meta_key = crypto::derive_meta_key(&master_key, &salt)?;
+    let encrypted_torrent = encrypt::encrypt_metadata(&torrent_data, &meta_key)?;
+    let encrypted_torrent_b64 = models::base64_encode(&encrypted_torrent);
+
+    // Calculate piece length for chunking (will match what was used in torrent)
+    let piece_length = torrent::calculate_piece_length(encrypted_data.len());
+
+    // Update room with torrent info
+    let size_mb = torrent::round_size_as_mb(encrypted_data.len());
+
+    let update_request = models::UpdateRoomRequest {
+        info_hash,
+        encrypted_torrent_file: encrypted_torrent_b64,
+        multi_file: is_directory,
+        size_mb,
+    };
+
+    temp_client
+        .update_room_metadata(&room_id, &writer_token, update_request)
+        .await?;
+
+    // Get B2 upload authorization
+
+    // Calculate number of chunks needed based on piece_length
+    let num_chunks = encrypted_data.len().div_ceil(piece_length);
+    // Need one token per parallel upload
+    let upload_tokens = temp_client
+        .get_b2_upload_auth(&room_id, &writer_token, num_chunks.min(10))
+        .await?;
+
+    if verbose {
+        println!("Number of chunks: {}", num_chunks);
+    }
+
+    let progress_bar = if !verbose {
+        let pb = ProgressBar::new(encrypted_data.len() as u64);
+        pb.enable_steady_tick(std::time::Duration::from_millis(10));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) ETA: {eta}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    upload_chunks_parallel(
+        &temp_client,
+        &upload_tokens,
+        &room_id,
+        &encrypted_data,
+        piece_length,
+        num_chunks,
+        progress_bar.as_ref(),
+        verbose,
+    )
+    .await?;
+
+    if let Some(ref pb) = progress_bar {
+        pb.finish_with_message(format!("Uploaded {} chunks", num_chunks));
+    }
+
+    // Mark upload as finished
+    temp_client.finish_upload(&room_id, &writer_token).await?;
+
+    // Build shareable URL
+    let master_key_b64url = models::base64url_encode(&master_key);
+    let share_url = format!("https://wormhole.app/{}#{}", room_id, master_key_b64url);
+
+    println!("\nShare URL: {}", share_url);
+
+    if let Some(lifetime) = room_data.lifetime {
+        println!("Expires in: {} hours", lifetime / 60 / 60);
+    }
+    if let Some(max_downloads) = room_data.max_downloads {
+        println!("Max downloads: {}", max_downloads);
+    }
+
+    Ok(share_url)
+}
+
+/// Helper module for base64 decoding
+mod base64 {
+    use anyhow::{Context, Result};
+    use base64::Engine;
+
+    pub fn decode(s: &str) -> Result<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .context("base64 decode failed")
+    }
+}
+
+/// Upload chunks in parallel to B2
+async fn upload_chunks_parallel(
+    client: &WormholeClient,
+    upload_tokens: &[models::B2UploadToken],
+    room_id: &str,
+    encrypted_data: &[u8],
+    piece_length: usize,
+    num_chunks: usize,
+    progress_bar: Option<&ProgressBar>,
+    verbose: bool,
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt, stream};
+    use std::sync::Arc;
+
+    // Clone progress bar into Arc for sharing across async tasks
+    let progress_bar_arc = progress_bar.map(|pb| Arc::new(pb.clone()));
+
+    stream::iter(0..num_chunks)
+        .map(|chunk_index| {
+            let pb = progress_bar_arc.clone();
+            async move {
+                let start = chunk_index * piece_length;
+                let end = std::cmp::min(start + piece_length, encrypted_data.len());
+                let chunk_data = encrypted_data[start..end].to_vec();
+
+                if verbose {
+                    println!("Uploading chunk {}/{}...", chunk_index + 1, num_chunks);
+                }
+
+                let progress_callback = pb.map(|pb| {
+                    move |bytes: usize| {
+                        pb.inc(bytes as u64);
+                    }
+                });
+
+                client
+                    .upload_to_b2(
+                        &upload_tokens[chunk_index % 10],
+                        room_id,
+                        chunk_index,
+                        chunk_data,
+                        progress_callback,
+                    )
+                    .await
+            }
+        })
+        .buffered(10)
+        .try_collect::<Vec<_>>()
+        .await?;
 
     Ok(())
 }
@@ -346,5 +741,188 @@ fn format_size(bytes: u64) -> String {
         format!("{} B", bytes)
     } else {
         format!("{:.2} {}", value, UNITS[exp])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_upload_and_download_roundtrip() {
+        // Create a temporary directory for test files
+        let temp_dir = std::env::temp_dir().join("wormhole_test");
+        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        // Create test file with known content
+        let test_content =
+            b"Hello, Wormhole! This is an end-to-end test of upload and download functionality.";
+        let upload_file_path = temp_dir.join("test_upload.txt");
+        fs::write(&upload_file_path, test_content).expect("failed to write test file");
+
+        println!("\n=== UPLOAD PHASE ===");
+
+        // Upload the file
+        let share_url = upload_file(&upload_file_path, false)
+            .await
+            .expect("Upload failed");
+
+        println!("\n✓ Upload successful! URL: {}", share_url);
+
+        println!("\n=== DOWNLOAD PHASE ===");
+
+        // Create download directory
+        let download_dir = temp_dir.join("download");
+        fs::create_dir_all(&download_dir).expect("failed to create download dir");
+
+        // Download the file
+        let download_result = download_file(&share_url, &download_dir, false, true).await;
+        assert!(
+            download_result.is_ok(),
+            "Download failed: {:?}",
+            download_result.err()
+        );
+
+        println!("\n✓ Download successful!");
+
+        // Verify the downloaded file matches the original
+        let downloaded_file_path = download_dir.join("test_upload.txt");
+        assert!(
+            downloaded_file_path.exists(),
+            "Downloaded file does not exist"
+        );
+
+        let downloaded_content =
+            fs::read(&downloaded_file_path).expect("failed to read downloaded file");
+
+        assert_eq!(
+            downloaded_content, test_content,
+            "Downloaded content does not match original"
+        );
+
+        println!("\n✓ Content verification passed!");
+        println!("\n=== ALL TESTS PASSED ===\n");
+
+        // Cleanup
+        fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_hex_encode() {
+        assert_eq!(hex_encode(&[0x00, 0xff, 0xab]), "00ffab");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1024 * 1024), "1.00 MB");
+    }
+
+    #[tokio::test]
+    async fn test_upload_download_various_sizes() {
+        use rand::Rng;
+
+        // Test file sizes from 0 bytes to 20MB
+        let test_sizes = vec![
+            0,                // Empty file
+            1,                // 1 byte
+            100,              // 100 bytes
+            1024,             // 1 KB
+            10 * 1024,        // 10 KB
+            100 * 1024,       // 100 KB
+            1024 * 1024,      // 1 MB
+            5 * 1024 * 1024,  // 5 MB
+            10 * 1024 * 1024, // 10 MB
+            20 * 1024 * 1024, // 20 MB
+        ];
+
+        let temp_dir = std::env::temp_dir().join("wormhole_size_test");
+        fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        for size in test_sizes {
+            println!(
+                "\n=== Testing file size: {} bytes ({}) ===",
+                size,
+                format_size(size as u64)
+            );
+
+            // Generate random content (or empty for 0 bytes)
+            let test_content: Vec<u8> = if size == 0 {
+                Vec::new()
+            } else {
+                (0..size)
+                    .map(|_| rand::thread_rng().r#gen::<u8>())
+                    .collect()
+            };
+
+            // Create test file
+            let upload_file_path = temp_dir.join(format!("test_{}_bytes.bin", size));
+            fs::write(&upload_file_path, &test_content).expect("failed to write test file");
+
+            // Upload the file
+            let share_url = match upload_file(&upload_file_path, false).await {
+                Ok(url) => {
+                    println!("✓ Upload successful for {} bytes", size);
+                    url
+                }
+                Err(e) => {
+                    panic!("Upload failed for size {}: {:?}", size, e);
+                }
+            };
+
+            // Create unique download directory for this size
+            let download_dir = temp_dir.join(format!("download_{}", size));
+            fs::create_dir_all(&download_dir).expect("failed to create download dir");
+
+            // Download the file
+            let download_result = download_file(&share_url, &download_dir, false, true).await;
+            assert!(
+                download_result.is_ok(),
+                "Download failed for size {}: {:?}",
+                size,
+                download_result.err()
+            );
+
+            println!("✓ Download successful for {} bytes", size);
+
+            // Verify the downloaded file matches the original
+            let downloaded_file_path = download_dir.join(format!("test_{}_bytes.bin", size));
+            assert!(
+                downloaded_file_path.exists(),
+                "Downloaded file does not exist for size {}",
+                size
+            );
+
+            let downloaded_content =
+                fs::read(&downloaded_file_path).expect("failed to read downloaded file");
+
+            assert_eq!(
+                downloaded_content.len(),
+                test_content.len(),
+                "Downloaded content size mismatch for size {}",
+                size
+            );
+
+            assert_eq!(
+                downloaded_content, test_content,
+                "Downloaded content does not match original for size {}",
+                size
+            );
+
+            println!("✓ Content verification passed for {} bytes", size);
+
+            // Clean up this test's files
+            fs::remove_file(&upload_file_path).ok();
+            fs::remove_dir_all(&download_dir).ok();
+        }
+
+        println!("\n=== ALL SIZE TESTS PASSED ===\n");
+
+        // Cleanup
+        fs::remove_dir_all(&temp_dir).ok();
     }
 }

@@ -5,7 +5,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, generic_array::GenericArray},
 };
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 /// A writer that discards all data (like /dev/null)
 struct NullWriter;
@@ -22,7 +22,7 @@ impl Write for NullWriter {
 
 /// Writer that can be either a file or a null sink
 enum FileOrNull {
-    File(std::fs::File),
+    File(BufWriter<std::fs::File>),
     Null(NullWriter),
 }
 
@@ -270,7 +270,7 @@ impl MultiFileDecryptor {
                     let file_path = self.base_path.join(&file_info.path);
                     let file = std::fs::File::create(&file_path)
                         .context(format!("failed to create file: {}", file_path.display()))?;
-                    FileOrNull::File(file)
+                    FileOrNull::File(BufWriter::new(file))
                 } else {
                     FileOrNull::Null(NullWriter)
                 };

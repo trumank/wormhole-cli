@@ -1,7 +1,7 @@
 //! Data models for Wormhole API and protocol
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Response from /api/room/{id}/salt endpoint
 #[derive(Debug, Deserialize)]
@@ -25,6 +25,43 @@ pub struct RoomResponse {
 pub struct B2AuthResponse {
     pub download_url: String,
     pub authorization_token: String,
+}
+
+/// Response from POST /api/room (room creation)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomCreateResponse {
+    pub id: String,
+    pub writer_token: String,
+    pub expires_at_timestamp_ms: Option<i64>,
+    pub max_downloads: Option<i32>,
+    pub lifetime: Option<i64>,
+}
+
+/// Upload authorization token from /api/room/{id}/b2/auth-upload
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct B2UploadToken {
+    pub upload_url: String,
+    pub authorization_token: String,
+}
+
+/// Request payload for creating a room
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRoomRequest {
+    pub reader_token: String,
+    pub salt: String,
+}
+
+/// Request payload for updating room metadata
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRoomRequest {
+    pub info_hash: String,
+    pub encrypted_torrent_file: String,
+    pub multi_file: bool,
+    pub size_mb: usize,
 }
 
 /// Parsed Wormhole URL components
@@ -67,6 +104,12 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>> {
 pub fn base64_encode(data: &[u8]) -> String {
     use base64::{Engine, engine::general_purpose::STANDARD};
     STANDARD.encode(data)
+}
+
+/// Encode bytes to base64url string (URL-safe, no padding)
+pub fn base64url_encode(data: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(data)
 }
 
 #[cfg(test)]
